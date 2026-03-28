@@ -1,0 +1,17 @@
+# Never commit plaintext secrets
+*.env
+*.key
+*.pem
+secrets.yml
+# But DO commit vault.yml (it's encrypted)
+
+# Ansible retry files
+*.retry
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+#Unnecessary even if encrypted
+vault.yml

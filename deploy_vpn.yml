@@ -1,0 +1,214 @@
+---
+- name: IKEv2 Remote Access VPN (Pure PKI / Certificates, Full Tunnel)
+  hosts: sandbox_devices
+  gather_facts: false
+  vars_files:
+    - vault.yml
+
+  # -----------------------------------------------------------------
+  # Vars: override in vault.yml or group_vars as needed
+  # -----------------------------------------------------------------
+  vars:
+    vpn_trustpoint:       VPN-TP
+    vpn_rsa_label:        VPN-RSA
+    vpn_pool_name:        RAVPN-POOL
+    vpn_pool_start:       10.10.10.10
+    vpn_pool_end:         10.10.10.100
+    vpn_pool_mask:        255.255.255.0
+    vpn_dns_primary:      8.8.8.8
+    vpn_dns_secondary:    8.8.4.4
+    wan_interface:        GigabitEthernet2   # public-facing interface
+
+  tasks:
+
+    # -----------------------------------------------------------------
+    # PKI: Cisco's Server Certificate
+    # -----------------------------------------------------------------
+    - name: Configure PKI Trustpoint for VPN
+      cisco.ios.ios_config:
+        lines:
+          - enrollment selfsigned
+          - subject-name CN=vpn.homelab.local
+          - subject-alt-name vpn.homelab.local
+          - revocation-check none
+          - rsakeypair VPN-RSA
+          - hash sha256
+        parents: crypto pki trustpoint VPN-TP
+
+    - name: Bind HTTP server to VPN Trustpoint (Fixes OpenSSL download)
+      cisco.ios.ios_config:
+        lines:
+          - ip http secure-trustpoint VPN-TP
+          - ip http secure-server
+
+    - name: Check if VPN certificate is already generated
+      cisco.ios.ios_command:
+        commands: "show crypto pki certificates VPN-TP"
+      register: pki_check
+
+    - name: Self-sign the trustpoint certificate (Handling interactive prompts)
+      cisco.ios.ios_command:
+        commands:
+          - command: "crypto pki enroll VPN-TP"
+            prompt:
+              - "continue generating"
+              - "serial number"
+              - "IP address"
+              - "Generate Self Signed"
+            answer:
+              - "yes"
+              - "no"
+              - "no"
+              - "yes"
+      when: "'Available' not in pki_check.stdout[0]"
+      ignore_errors: true
+
+
+# -----------------------------------------------------------------
+# PKI: Import Ubuntu's Root CA (Pre-Authenticated Fingerprint)
+# -----------------------------------------------------------------
+    - name: Format the CA Certificate (Strip headers and empty lines)
+      set_fact:
+        clean_ca_payload: "{{ lookup('file', '/etc/ipsec.d/cacerts/strongswanCaCert.pem').splitlines() | reject('search', 'CERTIFICATE') | select() | join('\n') }}"
+
+    - name: Get CA MD5 Fingerprint to bypass Cisco interactive prompt
+      delegate_to: localhost
+      shell: "openssl x509 -in /etc/ipsec.d/cacerts/strongswanCaCert.pem -noout -fingerprint -md5 | cut -d'=' -f2 | tr -d ':'"
+      register: ca_md5
+
+    - name: Configure Cisco Trustpoint with CA Fingerprint
+      cisco.ios.ios_config:
+        parents: "crypto pki trustpoint HOMELAB-CA"
+        lines:
+          - enrollment terminal
+          - revocation-check none
+          - "fingerprint {{ ca_md5.stdout }}"
+
+    - name: Import HomeLab-Root-CA into Cisco Router
+      cisco.ios.ios_command:
+        commands:
+          - command: "crypto pki authenticate HOMELAB-CA"
+            prompt:
+              - "base 64 encoded CA"
+            answer:
+              # Since the fingerprint is already verified, it won't ask yes/no!
+              - "{{ clean_ca_payload }}\nquit"
+      ignore_errors: true
+
+    # -----------------------------------------------------------------
+    # Client IP pool
+    # -----------------------------------------------------------------
+    - name: Configure VPN client IP pool
+      cisco.ios.ios_config:
+        lines:
+          - "ip local pool {{ vpn_pool_name }} {{ vpn_pool_start }} {{ vpn_pool_end }}"
+
+    # -----------------------------------------------------------------
+    # IKEv2 proposal and policy
+    # -----------------------------------------------------------------
+    - name: Configure IKEv2 proposal
+      cisco.ios.ios_config:
+        parents: crypto ikev2 proposal VPN-PROPOSAL
+        lines:
+          - encryption aes-cbc-256
+          - integrity sha256
+          - group 14
+
+    - name: Configure IKEv2 policy
+      cisco.ios.ios_config:
+        parents: crypto ikev2 policy VPN-POLICY
+        lines:
+          - proposal VPN-PROPOSAL
+
+    # -----------------------------------------------------------------
+    # IKEv2 authorization policy: pushes IP/DNS to client
+    # -----------------------------------------------------------------
+    - name: Configure IKEv2 authorization policy
+      cisco.ios.ios_config:
+        parents: crypto ikev2 authorization policy VPN-AUTHZ-POLICY
+        lines:
+          - "pool {{ vpn_pool_name }}"
+          - "dns {{ vpn_dns_primary }} {{ vpn_dns_secondary }}"
+          - route set interface
+          - route set access-list split-acl
+
+    - name: Configure full-tunnel ACL (permit any)
+      cisco.ios.ios_config:
+        parents: ip access-list standard split-acl
+        lines:
+          - permit any
+
+    # -----------------------------------------------------------------
+    # IKEv2 profile (UPDATED FOR MUTUAL RSA)
+    # -----------------------------------------------------------------
+    - name: Configure IKEv2 profile for Mutual Certificates
+      cisco.ios.ios_config:
+        parents: crypto ikev2 profile VPN-PROFILE
+        lines:
+          - "match identity remote any"
+          - "identity local dn"
+          - "authentication local rsa-sig"
+          - "authentication remote rsa-sig"
+          - "pki trustpoint {{ vpn_trustpoint }}"
+          - "pki trustpoint HOMELAB-CA"
+          - "virtual-template 1"
+
+    # -----------------------------------------------------------------
+    # IPsec transform-set and profile
+    # -----------------------------------------------------------------
+    - name: Configure IPsec transform-set
+      cisco.ios.ios_config:
+        parents: crypto ipsec transform-set VPN-TRANSFORM esp-aes 256 esp-sha256-hmac
+        lines:
+          - mode tunnel
+
+    - name: Configure IPsec profile
+      cisco.ios.ios_config:
+        parents: crypto ipsec profile VPN-IPSEC-PROFILE
+        lines:
+          - "set transform-set VPN-TRANSFORM"
+          - "set ikev2-profile VPN-PROFILE"
+
+    # -----------------------------------------------------------------
+    # Virtual template interface
+    # -----------------------------------------------------------------
+    - name: Configure Virtual-Template1
+      cisco.ios.ios_config:
+        parents: interface Virtual-Template1 type tunnel
+        lines:
+          - "ip unnumbered {{ wan_interface }}"
+          - tunnel mode ipsec ipv4
+          - "tunnel protection ipsec profile VPN-IPSEC-PROFILE"
+
+    # -----------------------------------------------------------------
+    # NAT exemption and overload
+    # -----------------------------------------------------------------
+    - name: Derive VPN pool network facts
+      ansible.builtin.set_fact:
+        vpn_pool_network: "{{ (vpn_pool_start + '/' + vpn_pool_mask) | ansible.utils.ipaddr('network') }}"
+        vpn_pool_hostmask: "{{ (vpn_pool_start + '/' + vpn_pool_mask) | ansible.utils.ipaddr('hostmask') }}"
+
+    - name: Configure NAT exemption ACL for VPN pool
+      cisco.ios.ios_config:
+        parents: ip access-list extended NAT-ACL
+        lines:
+          - "deny ip {{ vpn_pool_network }} {{ vpn_pool_hostmask }} any"
+          - permit ip any any
+
+    - name: Apply NAT overload on WAN interface
+      cisco.ios.ios_config:
+        lines:
+          - "ip nat inside source list NAT-ACL interface {{ wan_interface }} overload"
+
+    - name: Mark WAN interface as NAT outside
+      cisco.ios.ios_config:
+        parents: "interface {{ wan_interface }}"
+        lines:
+          - ip nat outside
+
+    # -----------------------------------------------------------------
+    # Save configuration
+    # -----------------------------------------------------------------
+    - name: Save configuration
+      cisco.ios.ios_config:
+        save_when: modified

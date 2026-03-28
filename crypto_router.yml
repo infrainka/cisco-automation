@@ -1,0 +1,28 @@
+---
+- name: Unlock Cisco Crypto Features
+  hosts: sandbox_devices
+  gather_facts: false
+
+  tasks:
+    - name: Set Premier License to unlock IKEv2
+      cisco.ios.ios_config:
+        lines:
+          - license boot level network-premier addon dna-premier
+
+    - name: Save the configuration before reboot
+      cisco.ios.ios_config:
+        save_when: always
+
+    - name: Send the reload command
+      ansible.netcommon.cli_command:
+        command: reload
+        prompt:
+          - "Proceed with reload\\? \\[confirm\\]"
+        answer:
+          - "\r"
+      ignore_errors: true
+
+    - name: Wait for the router to reboot and come back online (Takes 3-5 mins)
+      wait_for_connection:
+        delay: 60
+        timeout: 600
