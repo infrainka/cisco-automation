@@ -1,0 +1,18 @@
+---
+- name: Deploy High Availability (HSRP)
+  hosts: l3_switch
+  gather_facts: false
+
+  tasks:
+    - name: Configure HSRP on Core VLANs
+      cisco.ios.ios_config:
+        parents: "{{ item.parent }}"
+        lines:
+          - "ip address {{ item.ip }} 255.255.255.0"
+          - "standby {{ item.group }} ip {{ item.vip }}"
+          - "standby {{ item.group }} priority 150"
+          - "standby {{ item.group }} preempt"
+          - "standby {{ item.group }} authentication md5 key-string {{ hsrp_key }}"
+      loop:
+        - { parent: 'interface Vlan10', ip: '10.10.10.2', vip: '10.10.10.1', group: '10' }
+        - { parent: 'interface Vlan20', ip: '192.168.20.2', vip: '192.168.20.1', group: '20' }

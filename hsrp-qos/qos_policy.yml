@@ -1,0 +1,5 @@
+qos:
+  voice_percent: 30
+  scavenger_percent: 5
+  shaper_rate_bps: 2000000
+  wan_interface: "GigabitEthernet=0%2F0%2F0"
